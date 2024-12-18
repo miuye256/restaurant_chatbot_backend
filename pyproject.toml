@@ -1,0 +1,20 @@
+[tool.poetry]
+name = "restaurant-chatbot-backend"
+version = "0.1.0"
+description = ""
+authors = ["Your Name <you@example.com>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.11"
+uvicorn = "^0.34.0"
+sqlalchemy = "^2.0.36"
+python-dotenv = "^1.0.1"
+openai = "^1.57.4"
+requests = "^2.32.3"
+fastapi = "^0.115.6"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
