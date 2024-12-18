@@ -15,7 +15,7 @@ router = APIRouter()
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 def split_sentence(content: str):
-    pattern = r'([。、!?！？])'
+    pattern = r'([。!?！？])'
     parts = re.split(pattern, content)
     sentences = []
     current_sentence = ''
