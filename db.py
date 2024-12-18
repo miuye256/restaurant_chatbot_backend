@@ -9,7 +9,6 @@ engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-# チャットを保存するテーブルの定義
 class Chat(Base):
     __tablename__ = "chats"
 
@@ -17,8 +16,6 @@ class Chat(Base):
     created_at = Column(DateTime, default=datetime.now)
     messages = relationship("Message", back_populates="chat")
 
-# チャットのメッセージを保存するテーブルの定義
-# チャットに対して1対多の関係を持つ
 class Message(Base):
     __tablename__ = "messages"
 
@@ -30,14 +27,13 @@ class Message(Base):
 
     chat = relationship("Chat", back_populates="messages")
 
-# メニューテーブルの定義
 class Menu(Base):
     __tablename__ = "menus"
 
     id = Column(String, primary_key=True, index=True, default=lambda: str(uuid.uuid4()))
     name = Column(String, unique=True, index=True)
-    ingredients = Column(Text)  # JSON文字列やカンマ区切りでも可
-    allergies = Column(Text)     # アレルギー情報
+    ingredients = Column(Text)
+    allergies = Column(Text)
     is_halal = Column(Boolean, default=False)
 
 Base.metadata.create_all(bind=engine)

@@ -3,40 +3,20 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 import uuid
 import json
+import re
 from openai import OpenAI
-from db import  get_db, Chat, Message, Menu
+from db import  get_db, Chat, Message
 from model import ChatMessageInput
 from config import OPENAI_API_KEY
-import re
+from function_calling import get_menu_info_from_db, get_all_menus, get_all_menu_details
 
 router = APIRouter()
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# ユーザーメッセージを解析してメニュー問い合わせかどうかを判断する簡易関数
-def is_reservation_question(user_input: str) -> bool:
-    # 「予約」というキーワードがあれば予約関連とみなして対応不可
-    return "予約" in user_input
-
-def is_halal_question(user_input: str) -> bool:
-    # 「ハラール」というキーワードがあればハラール対応メニュー検索
-    return "ハラール" in user_input or "halal" in user_input.lower()
-
-def extract_menu_name(user_input: str, db: Session) -> str:
-    # 簡易実装: データベースにあるメニュー名がユーザー入力に含まれていればそれを返す
-    menus = db.query(Menu).all()
-    for m in menus:
-        if m.name in user_input:
-            return m.name
-    return ""
-
 def split_sentence(content: str):
     pattern = r'([。、!?！？])'
-
-    # 文章を分割
     parts = re.split(pattern, content)
-
-    # 分割された部分を統合して文を作成
     sentences = []
     current_sentence = ''
     for part in parts:
@@ -44,25 +24,22 @@ def split_sentence(content: str):
         if re.match(pattern, part):
             sentences.append(current_sentence)
             current_sentence = ''
-
-    # 最後の文が句読点で終わっていない場合も追加
     if current_sentence:
         sentences.append(current_sentence)
-
     return sentences
 
 def stream_json_res(obj: any) -> str:
     return f"{json.dumps(obj, ensure_ascii=False)}\n"
 
-# OpenAIへの問い合わせ（fallback用）
-def ask_gpt(messages):
-    response = client.chat.completions.create(
-        model="gpt-4",
-        messages=messages,
-        max_tokens=200,
-        temperature=0.7
-    )
-    return response.choices[0].message.content.strip()
+async def chat_stream(response_text: str, chat_id: str, db: Session):
+    splited_content = split_sentence(response_text)
+    full_content = response_text
+    for sentence in splited_content:
+        yield stream_json_res({'content': sentence})
+    db_message = Message(chat_id=chat_id, role="assistant", content=full_content)
+    db.add(db_message)
+    db.commit()
+    yield stream_json_res({'status': 'finished'})
 
 @router.post("/start_chat")
 async def start_chat(db: Session = Depends(get_db)):
@@ -72,77 +49,124 @@ async def start_chat(db: Session = Depends(get_db)):
     db_message = Message(
         chat_id=db_chat.id,
         role="system",
-        content="あなたは飲食店のユーザーからの質問に対応するAIです。丁寧な言葉遣いで対応してください。"
+        content=(
+            "You are a restaurant AI assistant. "
+            "The user will ask questions in English, and you should respond in English. "
+            "You have access to database functions to retrieve menu information. "
+            "Rules:\n"
+            "1. If a menu does not exist in the DB, respond with 'I'm sorry, but we don't have that menu item.'\n"
+            "2. If the menu name is vague or misspelled, try to find the closest match.\n"
+            "3. If asked about halal menus, use `get_all_menu_details` and list items with `is_halal = true`.\n"
+            "4. If asked 'What menus do you have?' call `list_menus` and show the menu list.\n"
+            "5. If specific menu info is needed, call `get_menu_info` and respond based on the returned data.\n"
+            "6. Do not make up false information.\n"
+            "7. Currently, only respond to queries about menu information.\n"
+            "8. If allergy information is requested, use the DB's `allergies` field.\n"
+            "9. If asked to speak in English, answer in English.\n"
+            "10. When asked about the menu in English, pick up what you think is appropriate from the DB information, translate it into English, and reply.\n"
+            "Always answer in a polite and helpful manner in English."
+        )
     )
     db.add(db_message)
     db.commit()
 
     return {"chat_id": id}
 
-async def chat_stream(response_text: str, chat_id: str, db: Session):
-    splited_content = split_sentence(response_text)
-    full_content = response_text
-    for sentence in splited_content:
-        yield stream_json_res({'content': sentence})
-    # DBにアシスタントメッセージとして保存
-    db_message = Message(
-        chat_id=chat_id, role="assistant", content=full_content)
-    db.add(db_message)
-    db.commit()
-    yield stream_json_res({'status': 'finished'})
+functions = [
+    {
+        "name": "get_menu_info",
+        "description": "メニュー名をもとにメニュー情報を取得する",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "menu_name": {"type": "string"}
+            },
+            "required": ["menu_name"]
+        }
+    },
+    {
+        "name": "list_menus",
+        "description": "メニュー一覧を取得する",
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "required": []
+        }
+    },
+    {
+        "name": "get_all_menu_details",
+        "description": "全メニューの詳細情報を取得する",
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "required": []
+        }
+    }
+]
+
+def call_openai(messages, db: Session):
+    response = client.chat.completions.create(model="gpt-4-0613",
+    messages=messages,
+    functions=functions,
+    function_call="auto")
+
+    if response.choices[0].finish_reason == "function_call":
+        fn_name = response.choices[0].message.function_call.name
+        fn_args = json.loads(response.choices[0].message.function_call.arguments)
+
+        if fn_name == "get_menu_info":
+            menu_info = get_menu_info_from_db(fn_args["menu_name"], db)
+            if menu_info is None:
+                answer = "申し訳ありません、そのようなメニューはありません。"
+                return answer
+            else:
+                follow_messages = messages + [{
+                    "role": "function",
+                    "name": fn_name,
+                    "content": json.dumps(menu_info, ensure_ascii=False)
+                }]
+                follow_response = client.chat.completions.create(model="gpt-4-0613",
+                messages=follow_messages)
+                return follow_response.choices[0].message.content.strip()
+
+        elif fn_name == "list_menus":
+            menu_names = get_all_menus(db)
+            follow_messages = messages + [{
+                "role": "function",
+                "name": fn_name,
+                "content": json.dumps({"menus": menu_names}, ensure_ascii=False)
+            }]
+            follow_response = client.chat.completions.create(model="gpt-4-0613",
+            messages=follow_messages)
+            return follow_response.choices[0].message.content.strip()
+
+        elif fn_name == "get_all_menu_details":
+            all_details = get_all_menu_details(db)
+            follow_messages = messages + [{
+                "role": "function",
+                "name": fn_name,
+                "content": json.dumps(all_details, ensure_ascii=False)
+            }]
+            follow_response = client.chat.completions.create(model="gpt-4-0613",
+            messages=follow_messages)
+            return follow_response.choices[0].message.content.strip()
+
+    else:
+        return response.choices[0].message.content.strip()
+
 
 @router.post("/chat/{chat_id}")
 async def chat_endpoint(chat_id: str, message: ChatMessageInput, db: Session = Depends(get_db)):
     chat = db.query(Chat).filter(Chat.id == chat_id).first()
     if not chat:
-        raise HTTPException(
-            status_code=404, detail="Chat not found")
-    
-    # ユーザーメッセージをDBに保存
-    db_message = Message(
-        chat_id=chat_id, role="user", content=message.content)
-    db.add(db_message)
+        raise HTTPException(status_code=404, detail="Chat not found")
+
+    db_user_message = Message(chat_id=chat_id, role="user", content=message.content)
+    db.add(db_user_message)
     db.commit()
 
-    user_input = message.content.strip()
-
-    # 予約関連判定
-    if is_reservation_question(user_input):
-        response_text = "申し訳ありません。現在予約には対応しておりません。"
-        return StreamingResponse(chat_stream(response_text, chat_id, db), media_type="text/event-stream")
-
-    # ハラール対応メニュー質問判定
-    if is_halal_question(user_input):
-        halal_menus = db.query(Menu).filter(Menu.is_halal == True).all()
-        if halal_menus:
-            names = [m.name for m in halal_menus]
-            response_text = "ハラール対応メニューは以下のとおりです。\n" + "\n".join(names)
-        else:
-            response_text = "ハラール対応メニューは現在提供しておりません。"
-        return StreamingResponse(chat_stream(response_text, chat_id, db), media_type="text/event-stream")
-
-    # 特定メニュー名が含まれるかチェック
-    menu_name = extract_menu_name(user_input, db)
-    if menu_name:
-        # メニュー詳細返答
-        menu = db.query(Menu).filter(Menu.name == menu_name).first()
-        if menu:
-            response_text = f"{menu_name}の情報です。\n材料: {menu.ingredients}\nアレルギー: {menu.allergies}\nハラール対応: {'はい' if menu.is_halal else 'いいえ'}"
-            return StreamingResponse(chat_stream(response_text, chat_id, db), media_type="text/event-stream")
-
-    # 上記以外の質問はOpenAIに投げてみる
-    # 一旦既存メッセージを全て取得
-    messages = []
     chat_messages = db.query(Message).filter(Message.chat_id == chat_id).order_by(Message.created_at).all()
-    for m in chat_messages:
-        messages.append({"role": m.role, "content": m.content})
+    messages = [{"role": m.role, "content": m.content} for m in chat_messages]
 
-    gpt_answer = ask_gpt(messages)
-    # 「わからない」や「答えられない」などが返ってきたら答えられない旨を送信
-    # 簡易的にgpt_answerを判定
-    if "わから" in gpt_answer or "不明" in gpt_answer or "答えられ" in gpt_answer:
-        response_text = "申し訳ありません。その質問にはお答えできません。"
-    else:
-        response_text = gpt_answer
-
+    response_text = call_openai(messages, db)
     return StreamingResponse(chat_stream(response_text, chat_id, db), media_type="text/event-stream")
